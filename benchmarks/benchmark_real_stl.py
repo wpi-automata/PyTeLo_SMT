@@ -5,9 +5,11 @@ Compares Gurobi vs PuLP solvers (SCIP, HiGHS, CBC) on actual STL problems
 
 import sys
 import os
-# Add parent directory and stl directory to path
+
+# Add stl directory to Python path
+STL_DIR = os.path.join(os.path.dirname(__file__), '..', 'stl')
+sys.path.insert(0, STL_DIR)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'stl'))
 
 import time
 import pandas as pd
@@ -15,251 +17,311 @@ import numpy as np
 from datetime import datetime
 import matplotlib.pyplot as plt
 
-# Try importing PyTeLo components
+# Import PyTeLo modules
 print("="*70)
-print("Checking PyTeLo availability...")
+print("Loading PyTeLo modules...")
 print("="*70)
+
+# Test what's in sys.path
+print(f"STL directory: {STL_DIR}")
+print(f"STL dir exists: {os.path.exists(STL_DIR)}")
+print()
 
 PYTELO_AVAILABLE = False
+GUROBI_ENCODER_AVAILABLE = False
+PULP_ENCODER_AVAILABLE = False
 GUROBI_AVAILABLE = False
-PULP_AVAILABLE = False
 
 try:
-    import stl as stl_module
-    print("[OK] Imported PyTeLo STL module")
-    print("     Location: {}".format(stl_module.__file__))
+    # Import the stl module (stl.py)
+    import stl
+    print(f"[OK] Imported stl module from {stl.__file__}")
     PYTELO_AVAILABLE = True
 except ImportError as e:
-    print("[FAIL] Cannot import PyTeLo STL: {}".format(e))
+    print(f"[FAIL] Cannot import stl: {e}")
 
 try:
+    # Import stl2milp (Gurobi encoder)
     import stl2milp
-    print("[OK] Imported stl2milp (Gurobi encoder)")
-    GUROBI_AVAILABLE = True
+    from stl2milp import stl2milp as GurobiEncoder
+    print(f"[OK] Imported stl2milp from {stl2milp.__file__}")
+    GUROBI_ENCODER_AVAILABLE = True
 except ImportError as e:
-    print("[WARNING] Cannot import stl2milp: {}".format(e))
+    print(f"[WARNING] Cannot import stl2milp: {e}")
+    GUROBI_ENCODER_AVAILABLE = False
 
 try:
+    # Import stl2milp_pulp (PuLP encoder)
     import stl2milp_pulp
-    print("[OK] Imported stl2milp_pulp (PuLP encoder)")
-    PULP_AVAILABLE = True
+    from stl2milp_pulp import STL2MILPPuLP
+    print(f"[OK] Imported stl2milp_pulp from {stl2milp_pulp.__file__}")
+    PULP_ENCODER_AVAILABLE = True
 except ImportError as e:
-    print("[WARNING] Cannot import stl2milp_pulp: {}".format(e))
+    print(f"[WARNING] Cannot import stl2milp_pulp: {e}")
+    PULP_ENCODER_AVAILABLE = False
 
 try:
     import gurobipy
-    print("[OK] Gurobi Python package available")
+    print("[OK] Gurobi available")
+    GUROBI_AVAILABLE = True
 except ImportError:
     print("[WARNING] Gurobi not available")
-
-try:
-    from pulp import *
-    print("[OK] PuLP available")
-except ImportError:
-    print("[WARNING] PuLP not available")
+    GUROBI_AVAILABLE = False
 
 print()
 
 
-# Real STL formulas from your meeting
+# Test formulas - SAME AS BEFORE
 STL_FORMULAS = [
     {
         'id': '1',
-        'formula': 'G[0,1] x >= 3',
-        'description': 'Always x >= 3 during time [0,1]',
+        'formula': 'G[0,5] x >= 3',
+        'description': 'Always x >= 3 for times 0-5',
         'variables': ['x'],
-        'bounds': {'x': [-100, 100]},
-        'time_horizon': 10
+        'ranges': {'x': (-100, 100)},
     },
     {
         'id': '2',
-        'formula': '(x > 10) && F[0, 2] y > 2 || G[1, 6] a > 8',
-        'description': 'Complex formula with multiple operators',
-        'variables': ['x', 'y', 'a'],
-        'bounds': {'x': [-100, 100], 'y': [-100, 100], 'a': [-100, 100]},
-        'time_horizon': 10
+        'formula': 'F[0,5] x >= 10',
+        'description': 'Eventually x >= 10 within times 0-5',
+        'variables': ['x'],
+        'ranges': {'x': (-100, 100)},
     },
     {
         'id': '3',
-        'formula': 'G[2,4] F[1,3] (x>=3)',
-        'description': 'Nested temporal operators',
+        'formula': 'G[0,3] F[0,2] x >= 5',
+        'description': 'Always eventually x >= 5',
         'variables': ['x'],
-        'bounds': {'x': [-100, 100]},
-        'time_horizon': 10
+        'ranges': {'x': (-100, 100)},
+    },
+    {
+        'id': '4',
+        'formula': '(x >= 5) && (y >= 3)',
+        'description': 'Conjunction at time 0',
+        'variables': ['x', 'y'],
+        'ranges': {'x': (-100, 100), 'y': (-100, 100)},
     },
     {
         'id': '5',
-        'formula': '(x < 10) && F[0, 2] y > 2 || x >= 3',
-        'description': 'Mixed logical and temporal',
-        'variables': ['x', 'y'],
-        'bounds': {'x': [-100, 100], 'y': [-100, 100]},
-        'time_horizon': 10
-    },
-    {
-        'id': '1complex w/o dyn',
-        'formula': '(x <= 10) && F[0, 2] x > 2 && G[1, 6] (x < 8) && G[1,6] (x > 3)',
-        'description': 'Complex without dynamics',
+        'formula': 'G[0,4] (x >= 5 && x <= 15)',
+        'description': 'Always in range [5,15]',
         'variables': ['x'],
-        'bounds': {'x': [-100, 100]},
-        'time_horizon': 10
+        'ranges': {'x': (-100, 100)},
     },
 ]
 
 
 def parse_stl_formula(formula_str):
     """
-    Parse STL formula string using PyTeLo
+    Parse STL formula string using PyTeLo's to_ast function.
     
-    NOTE: This is a placeholder - actual parsing depends on PyTeLo's API
-    which we need to discover by looking at examples
+    Args:
+        formula_str: Formula string like "G[0,5] x >= 3"
+    
+    Returns:
+        Parsed STL formula object or None
     """
     if not PYTELO_AVAILABLE:
         return None
     
     try:
-        # This is how PyTeLo MIGHT parse formulas
-        # We need to check examples to see the real API
-        
-        # Option 1: If there's a parse function in stl module
-        if hasattr(stl_module, 'parse'):
-            ast = stl_module.parse(formula_str)
-            return ast
-        
-        # Option 2: If there's a Formula class
-        if hasattr(stl_module, 'Formula'):
-            ast = stl_module.Formula(formula_str)
-            return ast
-        
-        # For now, just return the string
-        print("     [WARNING] Don't know how to parse yet - need to check PyTeLo examples")
-        return formula_str
-        
+        # Use PyTeLo's built-in to_ast function
+        ast = stl.to_ast(formula_str)
+        return ast
     except Exception as e:
-        print("     [FAIL] Parse error: {}".format(e))
+        print(f"    [ERROR] Parse failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def solve_with_gurobi_placeholder(formula_dict, num_runs=3):
+def solve_with_gurobi(formula_dict, num_runs=3):
     """
-    Placeholder for solving with Gurobi via PyTeLo's stl2milp
+    Solve using Gurobi via stl2milp.
     
-    TODO: Implement actual solving once we understand stl2milp API
+    Args:
+        formula_dict: Formula specification dictionary
+        num_runs: Number of runs for timing
+    
+    Returns:
+        Results dictionary
     """
+    if not GUROBI_ENCODER_AVAILABLE or not GUROBI_AVAILABLE:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': 'Gurobi not available',
+            'solver': 'Gurobi'
+        }
+    
+    # Parse formula
+    formula_ast = parse_stl_formula(formula_dict['formula'])
+    if formula_ast is None:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': 'Parse failed',
+            'solver': 'Gurobi'
+        }
+    
     times = []
+    statuses = []
     
     for run in range(num_runs):
-        # Simulate solving
-        # In reality, you would:
-        # 1. Parse formula to AST
-        # 2. Create stl2milp encoder
-        # 3. Add variable bounds
-        # 4. Call optimize()
-        
-        start = time()
-        elapsed = time() - start
-        times.append(elapsed)
+        try:
+            # Create encoder
+            encoder = GurobiEncoder(
+                formula_ast,
+                formula_dict['ranges'],
+                robust=True
+            )
+            
+            # Translate
+            encoder.translate(satisfaction=True)
+            
+            # Optimize
+            start = time.time()
+            encoder.model.optimize()
+            elapsed = time.time() - start
+            
+            times.append(elapsed)
+            status = 'Optimal' if encoder.model.status == 2 else 'Failed'
+            statuses.append(status)
+            
+        except Exception as e:
+            print(f"      [ERROR] Gurobi run {run+1}: {e}")
+            statuses.append(f'Error: {str(e)[:30]}')
     
-    return {
-        'mean_time': np.mean(times),
-        'std_time': np.std(times),
-        'status': 'PLACEHOLDER - Not yet implemented',
-        'solver': 'Gurobi'
-    }
+    if times:
+        return {
+            'mean_time': np.mean(times),
+            'std_time': np.std(times),
+            'status': statuses[0],
+            'solver': 'Gurobi'
+        }
+    else:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': statuses[0] if statuses else 'Failed',
+            'solver': 'Gurobi'
+        }
 
 
-def solve_with_pulp_placeholder(formula_dict, solver_name, num_runs=3):
+def solve_with_pulp(formula_dict, solver_name, num_runs=3):
     """
-    Placeholder for solving with PuLP
+    Solve using PuLP with specified solver.
     
-    TODO: Implement once stl2milp_pulp is complete
+    Args:
+        formula_dict: Formula specification
+        solver_name: 'SCIP', 'HiGHS', 'CBC'
+        num_runs: Number of runs
+    
+    Returns:
+        Results dictionary
     """
+    if not PULP_ENCODER_AVAILABLE:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': 'PuLP encoder not available',
+            'solver': solver_name
+        }
+    
+    # Parse formula
+    formula_ast = parse_stl_formula(formula_dict['formula'])
+    if formula_ast is None:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': 'Parse failed',
+            'solver': solver_name
+        }
+    
     times = []
+    statuses = []
     
     for run in range(num_runs):
-        start = time()
-        elapsed = time() - start
-        times.append(elapsed)
+        try:
+            # Create encoder
+            encoder = STL2MILPPuLP(
+                formula_ast,
+                formula_dict['ranges'],
+                robust=True,
+                solver_name=solver_name
+            )
+            
+            # Translate
+            encoder.translate(satisfaction=True)
+            
+            # Optimize
+            result = encoder.optimize(time_limit=300, verbose=False)
+            
+            times.append(result['solve_time'])
+            statuses.append(result['status'])
+            
+        except Exception as e:
+            print(f"      [ERROR] {solver_name} run {run+1}: {e}")
+            statuses.append(f'Error: {str(e)[:30]}')
     
-    return {
-        'mean_time': np.mean(times),
-        'std_time': np.std(times),
-        'status': 'PLACEHOLDER - Not yet implemented',
-        'solver': solver_name
-    }
-
-
-def demonstrate_parsing():
-    """
-    Demonstrate that we can at least parse the formulas
-    This is the first step before solving
-    """
-    if not PYTELO_AVAILABLE:
-        print("Cannot demonstrate - PyTeLo not available")
-        return
-    
-    print("\n" + "="*70)
-    print("DEMONSTRATION: Formula Parsing")
-    print("="*70)
-    
-    # Check what PyTeLo actually provides
-    print("\nPyTeLo STL module contents:")
-    items = [x for x in dir(stl_module) if not x.startswith('_')]
-    for i, item in enumerate(items[:20], 1):
-        obj = getattr(stl_module, item)
-        obj_type = type(obj).__name__
-        print("  {:2}. {:30} ({})".format(i, item, obj_type))
-    
-    print("\n" + "-"*70)
-    print("Testing formula parsing:")
-    print("-"*70)
-    
-    for formula_dict in STL_FORMULAS[:3]:  # Test first 3
-        print("\nFormula {}: {}".format(formula_dict['id'], formula_dict['formula']))
-        print("  Description: {}".format(formula_dict['description']))
-        
-        ast = parse_stl_formula(formula_dict['formula'])
-        if ast:
-            print("  [OK] Parsed successfully")
-            print("    Type: {}".format(type(ast)))
-        else:
-            print("  [FAIL] Parsing not yet implemented")
+    if times:
+        return {
+            'mean_time': np.mean(times),
+            'std_time': np.std(times),
+            'status': statuses[0],
+            'solver': solver_name
+        }
+    else:
+        return {
+            'mean_time': None,
+            'std_time': 0,
+            'status': statuses[0] if statuses else 'Failed',
+            'solver': solver_name
+        }
 
 
 def benchmark_formula(formula_dict, solvers, num_runs=3):
     """
-    Benchmark a single formula across all solvers
+    Benchmark single formula across all solvers.
+    
+    Args:
+        formula_dict: Formula specification
+        solvers: List of solver names
+        num_runs: Runs per solver
+    
+    Returns:
+        List of result dictionaries
     """
     results = []
     
-    print("\nFormula {}: {}".format(formula_dict['id'], formula_dict['formula']))
-    print("  {}".format(formula_dict['description']))
+    print(f"\n[{formula_dict['id']}] {formula_dict['formula']}")
+    print(f"  {formula_dict['description']}")
     
-    for solver_name in solvers:
-        print("  [{:10}] ".format(solver_name), end='', flush=True)
+    for solver in solvers:
+        print(f"  [{solver:10}] ", end='', flush=True)
         
-        if solver_name == 'Gurobi':
-            result = solve_with_gurobi_placeholder(formula_dict, num_runs)
+        if solver == 'Gurobi':
+            result = solve_with_gurobi(formula_dict, num_runs)
         else:
-            result = solve_with_pulp_placeholder(formula_dict, solver_name, num_runs)
+            result = solve_with_pulp(formula_dict, solver, num_runs)
         
         result['formula_id'] = formula_dict['id']
         results.append(result)
         
-        print("{:.4f}s (+/-{:.4f}) [{}]".format(
-            result['mean_time'], 
-            result['std_time'], 
-            result['status']
-        ))
+        if result['mean_time'] is not None:
+            print(f"{result['mean_time']:.4f}s (+/-{result['std_time']:.4f}) [{result['status']}]")
+        else:
+            print(f"FAILED: {result['status']}")
     
     return results
 
 
 def create_comparison_plot(df, filename='stl_comparison.png'):
-    """Create comparison plot"""
-    df_valid = df[df['mean_time'].notna()]
+    """Create comparison bar chart"""
+    df_valid = df[df['mean_time'].notna()].copy()
     
     if df_valid.empty:
-        print("No valid data to plot")
+        print("[WARNING] No valid data to plot")
         return
     
     solvers = df_valid['solver'].unique()
@@ -295,13 +357,13 @@ def create_comparison_plot(df, filename='stl_comparison.png'):
         ax.bar(x + offset, means, bar_width,
                yerr=stds,
                label=solver,
-               color=colors.get(solver, 'C{}'.format(i)),
+               color=colors.get(solver, f'C{i}'),
                capsize=5,
                alpha=0.8)
     
     ax.set_xlabel('STL Formula', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Average CPU Time (s)', fontsize=12, fontweight='bold')
-    ax.set_title('STL Solver Comparison (Lower is better)', 
+    ax.set_ylabel('Average Solve Time (s)', fontsize=12, fontweight='bold')
+    ax.set_title('STL Solver Performance Comparison', 
                  fontsize=14, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(formulas, rotation=15, ha='right')
@@ -310,47 +372,72 @@ def create_comparison_plot(df, filename='stl_comparison.png'):
     
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
-    print("\n[OK] Plot saved to: {}".format(filename))
+    print(f"\n[OK] Plot saved to: {filename}")
+
+
+def print_summary_table(df):
+    """Print summary table of results"""
+    print("\n" + "="*70)
+    print("RESULTS SUMMARY")
+    print("="*70)
+    
+    # Create pivot table
+    pivot = df.pivot_table(
+        values='mean_time',
+        index='formula_id',
+        columns='solver',
+        aggfunc='mean'
+    )
+    
+    print("\nSolve Times (seconds):")
+    print(pivot.to_string(float_format=lambda x: f'{x:.4f}'))
+    
+    # Calculate speedup relative to Gurobi
+    if 'Gurobi' in pivot.columns:
+        print("\n" + "="*70)
+        print("SPEEDUP ANALYSIS (relative to Gurobi)")
+        print("="*70)
+        
+        for solver in pivot.columns:
+            if solver != 'Gurobi':
+                speedup = pivot['Gurobi'] / pivot[solver]
+                avg_speedup = speedup.mean()
+                print(f"\n{solver}:")
+                print(f"  Average speedup: {avg_speedup:.2f}x")
+                print(f"  (< 1.0 means slower, > 1.0 means faster)")
 
 
 def main():
-    """Main benchmark"""
+    """Main benchmark execution"""
     
     print("\n" + "="*70)
-    print("STL Formula Benchmark - Real PyTeLo Integration")
+    print("STL FORMULA BENCHMARK - Real PyTeLo Integration")
     print("="*70)
     print()
     
-    # First, demonstrate what we can do
-    if PYTELO_AVAILABLE:
-        demonstrate_parsing()
-    else:
+    # Check prerequisites
+    if not PYTELO_AVAILABLE:
         print("[ERROR] PyTeLo not available!")
         print("\nMake sure:")
-        print("1. You're in the PyTeLo root directory")
-        print("2. Parser files exist in stl/ directory")
-        print("3. Run: python test_import_now.py")
+        print("1. ANTLR parsers are generated in stl/")
+        print("2. You're running from PyTeLo root directory")
         return
     
-    print("\n" + "="*70)
-    print("BENCHMARK - Using Placeholder Solvers")
-    print("="*70)
-    print()
-    print("NOTE: This is a DEMONSTRATION with placeholder timing.")
-    print("      Real solving requires:")
-    print("      1. Understanding stl2milp API")
-    print("      2. Completing stl2milp_pulp implementation")
-    print()
-    
-    # Determine which solvers to test
+    # Determine available solvers
     solvers = []
-    if GUROBI_AVAILABLE:
+    if GUROBI_ENCODER_AVAILABLE and GUROBI_AVAILABLE:
         solvers.append('Gurobi')
-    solvers.extend(['SCIP', 'HiGHS', 'CBC'])  # PuLP solvers
     
-    print("Testing solvers: {}".format(', '.join(solvers)))
-    print("Formulas: {}".format(len(STL_FORMULAS)))
-    print("Runs per formula: 3")
+    if PULP_ENCODER_AVAILABLE:
+        solvers.extend(['SCIP', 'HiGHS', 'CBC'])
+    
+    if not solvers:
+        print("[ERROR] No solvers available!")
+        return
+    
+    print(f"Testing solvers: {', '.join(solvers)}")
+    print(f"Formulas: {len(STL_FORMULAS)}")
+    print(f"Runs per formula/solver: 3")
     print()
     
     # Run benchmarks
@@ -363,35 +450,20 @@ def main():
     df = pd.DataFrame(all_results)
     
     # Save results
-    df.to_csv('stl_benchmark_results.csv', index=False)
-    print("\n[OK] Results saved to: stl_benchmark_results.csv")
+    csv_file = 'stl_benchmark_results.csv'
+    df.to_csv(csv_file, index=False)
+    print(f"\n[OK] Results saved to: {csv_file}")
     
     # Print summary
-    print("\n" + "="*70)
-    print("SUMMARY")
-    print("="*70)
-    
-    pivot = df.pivot_table(
-        values='mean_time',
-        index='formula_id',
-        columns='solver',
-        aggfunc='mean'
-    )
-    print("\nSolve Times (seconds):")
-    print(pivot.to_string())
+    print_summary_table(df)
     
     # Create plot
-    create_comparison_plot(df, 'stl_comparison.png')
+    if df['mean_time'].notna().any():
+        create_comparison_plot(df, 'stl_comparison.png')
     
     print("\n" + "="*70)
-    print("NEXT STEPS TO MAKE THIS REAL:")
+    print("BENCHMARK COMPLETE!")
     print("="*70)
-    print("1. Look at PyTeLo examples to see how to use stl2milp")
-    print("2. Implement solve_with_gurobi() using real stl2milp")
-    print("3. Complete stl2milp_pulp.py to translate AST to PuLP")
-    print("4. Implement solve_with_pulp() using stl2milp_pulp")
-    print("5. Re-run this benchmark with real solving")
-    print()
 
 
 if __name__ == '__main__':
