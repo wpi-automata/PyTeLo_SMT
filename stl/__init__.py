@@ -1,4 +1,4 @@
-from .stlLexer import stlLexer
-from .stlParser import stlParser
-from .stl import STLAbstractSyntaxTreeExtractor
-from .stl import Operation, RelOperation, STLFormula, Trace, to_ast
+from stl.stlLexer import stlLexer
+from stl.stlParser import stlParser
+from stl.stl import STLAbstractSyntaxTreeExtractor
+from stl.stl import Operation, RelOperation, STLFormula, Trace, to_ast
